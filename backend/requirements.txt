@@ -1,0 +1,14 @@
+# ml_dtypes のソースビルド（C++コンパイル）を回避するため、wheelが提供されている安定版を固定
+ml_dtypes==0.4.0
+
+# 既存のパッケージ
+torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+fastapi==0.115.0
+uvicorn==0.32.0
+python-multipart==0.0.12
+mangum==0.17.0
+mediapipe==0.10.14
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+scipy==1.13.1
+ultralytics==8.3.0

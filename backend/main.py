@@ -12,12 +12,15 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.signal import savgol_filter
 
-app = FastAPI(title="Tennis Motion Analysis OS", version="1.0.0")
+from skeleton_correction.data_processing import NUM_JOINTS, denormalize, preprocess_arrays
+from skeleton_correction.model import SkeletonRefiner
+
+app = FastAPI(title="Tennis Motion Analysis OS", version="1.1.0")
 
 # 🔒 CORS設定
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,11 +30,13 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {
-        "status": "ok", 
+        "status": "ok",
         "message": "Tennis Motion Analysis API is running on Google Cloud Run!",
+        "skeleton_refiner": REFINER_INFO,
     }
 
 # --- 📁 グローバル設定と一時保管エリア ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = "/tmp/tennis_motion_videos"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -53,6 +58,32 @@ pose_estimator = mp_pose.Pose(
 
 # 主要IDの定義 (100: 頭部中心, 99: ラケット)
 REQUIRED_IDS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 99, 100]
+HEAD_SRC_IDS = [0, 7, 8]       # 鼻・左耳・右耳 → 頭部中心 (ID 100)
+RACKET_HAND_ID = 16            # 右手首 → ラケット (ID 99) の探索基準
+RACKET_MAX_DIST_PX = 300
+
+
+# 2. 骨格補正モデル (skeleton_correction/train_prototype.py で学習した best.pt)
+SKELETON_CKPT = os.environ.get("SKELETON_CKPT", os.path.join(BASE_DIR, "models", "best.pt"))
+
+
+def load_skeleton_refiner(ckpt_path: str):
+    """best.pt を読み込む。存在しない場合は None（補正なしで動作を継続）。"""
+    if not os.path.exists(ckpt_path):
+        print(f"[skeleton_refiner] checkpoint not found: {ckpt_path} → 補正をスキップします")
+        return None, {"enabled": False, "checkpoint": ckpt_path}
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+    a = ckpt["args"]  # 学習時の設定からモデル構造を再現
+    model = SkeletonRefiner(num_joints=NUM_JOINTS, hidden=a["hidden"], num_blocks=a["blocks"],
+                            backbone=a["backbone"]).to(DEVICE)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    info = {"enabled": True, "checkpoint": ckpt_path, "epoch": ckpt.get("epoch"), "backbone": a["backbone"]}
+    print(f"[skeleton_refiner] loaded {info}")
+    return model, info
+
+
+skeleton_refiner, REFINER_INFO = load_skeleton_refiner(SKELETON_CKPT)
 
 # ==============================================================================
 # 🚀 ROS-like Service Node Endpoint
@@ -61,7 +92,12 @@ REQUIRED_IDS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 
 async def request_motion_analysis(video: UploadFile = File(...)):
     """
     [ROS Service] /tennis_motion/analysis_node/request
-    動画を受け取り、YOLO + MediaPipe骨格抽出からSavgolフィルタによる空間平滑化までを一挙に行う
+    動画を受け取り、
+      ① YOLO + MediaPipe で純粋な 33 点を取得
+      ② best.pt (SkeletonRefiner) で 33 点を補正
+      ③ 補正後の骨格から頭部中心 (100)・ラケット (99) を算出
+      ④ 空間正規化 + Savgol フィルタ
+    までを一挙に行う
     """
     if not video.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         raise HTTPException(status_code=400, detail="無効な動画フォーマットです。")
@@ -74,13 +110,18 @@ async def request_motion_analysis(video: UploadFile = File(...)):
         with open(input_video_path, "wb") as buffer:
             shutil.copyfileobj(video.file, buffer)
 
-        # 2. Pipeline ①: bone_track コア処理の実行
-        raw_data_log = execute_bone_tracking(input_video_path)
-        
-        if not raw_data_log["frames"]:
+        # 2. Pipeline ①: MediaPipe 33 点の抽出（独自関節なし）
+        pose_track = execute_pose_extraction(input_video_path)
+        if not pose_track["detected"].any():
             raise HTTPException(status_code=422, detail="動画から有効な人物の骨格フレームを検出できませんでした。")
 
-        # 3. Pipeline ②: 空間正規化 & SavgolFilter 処理の実行
+        # 3. Pipeline ②: best.pt による 33 点の補正
+        corrected_xyz = refine_landmarks(pose_track)
+
+        # 4. Pipeline ③: 補正後の骨格から頭部・ラケットを付与し、従来形式のログを構築
+        raw_data_log = build_keypoint_log(pose_track, corrected_xyz)
+
+        # 5. Pipeline ④: 空間正規化 & SavgolFilter 処理の実行
         final_analyzed_data = apply_spatial_normalization_and_filter(raw_data_log, window_length=5, polyorder=2)
 
         # 🚀 フロントエンド（Next.js）のチャート表示やモック通知用にサマリーを計算
@@ -89,9 +130,9 @@ async def request_motion_analysis(video: UploadFile = File(...)):
             for skel in frame["skeletons"]:
                 for kp in skel["keypoints"]:
                     if kp["id"] == 99: # ラケット速度
-                        v = kp["velocity"] * 10 
+                        v = kp["velocity"] * 10
                         if v > swing_speed_kmh: swing_speed_kmh = v
-        
+
         return {
             "status": "success",
             "video_id": video_id,
@@ -104,10 +145,12 @@ async def request_motion_analysis(video: UploadFile = File(...)):
             "payload": final_analyzed_data # 解析データ本体
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[Error in analysis_node]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"内部解析エラー: {str(e)}")
-        
+
     finally:
         # 後始末: ディスク容量を圧迫しないよう、処理が終わった元動画は即座に削除
         if os.path.exists(input_video_path):
@@ -115,169 +158,181 @@ async def request_motion_analysis(video: UploadFile = File(...)):
 
 
 # ==============================================================================
-# 🧠 Pipeline ①: 骨格検出 & 幾何奥行計算コアロジック (メモリ展開版)
+# 🧠 Pipeline ①: YOLO + MediaPipe による純粋な 33 点の抽出
 # ==============================================================================
-def execute_bone_tracking(video_path: str) -> dict:
+def execute_pose_extraction(video_path: str) -> dict:
+    """座標は学習データ (docs/dataset_memo/json) と同じ「画像全体」基準:
+         x, y : 画像幅・高さで 0-1 正規化
+         z    : MediaPipe 相対深度（画像幅スケール）
+    ROI 内で推論した MediaPipe の座標を画像全体の座標に戻して保持する。
+    """
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    data_log = {
-        "metadata": {
-            "fps": fps,
-            "resolution": {"width": width, "height": height},
-            "required_ids": REQUIRED_IDS
-        },
-        "frames": []
-    }
-
-    prev_landmarks = {}
-    frame_count = 0
-    base_torso_length = None
-    prev_calculated_dz = 0.0
-    SMOOTHING_FACTOR = 0.15
+    xyz_list, vis_list, detected, bboxes, rackets_per_frame = [], [], [], [], []
 
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
             break
 
-        frame_data = {
-            "frame_index": frame_count,
-            "timestamp": round(frame_count / fps, 4),
-            "skeletons": []
-        }
+        xyz = np.zeros((NUM_JOINTS, 3), dtype=np.float64)
+        vis = np.zeros(NUM_JOINTS, dtype=np.float64)
+        found = False
+        bbox = None
 
         # YOLO推論 (0=Person, 38=Racket)
         yolo_results = yolo_model.predict(frame, classes=[0, 38], conf=0.35, verbose=False, device=DEVICE)
         persons = []
-        rackets = []
+        rackets = []  # ラケット中心 (画像ピクセル座標)
 
         for result in yolo_results:
             if result.boxes is None: continue
-            boxes_tensor = result.boxes.xyxy
-            clss_tensor = result.boxes.cls
-            for box, cls in zip(boxes_tensor, clss_tensor):
-                box_np = box.cpu().numpy()
+            for box, cls in zip(result.boxes.xyxy, result.boxes.cls):
                 if int(cls) == 0:
                     persons.append(box)
                 elif int(cls) == 38:
-                    rackets.append(box_np)
+                    rx1, ry1, rx2, ry2 = box.cpu().numpy()
+                    rackets.append(((rx1 + rx2) / 2.0, (ry1 + ry2) / 2.0))
 
         # 主役判定 (Bounding Boxの面積が最大の人)
-        main_person_box = None
         if persons:
             persons_t = torch.stack(persons)
             areas = (persons_t[:, 2] - persons_t[:, 0]) * (persons_t[:, 3] - persons_t[:, 1])
-            max_idx = torch.argmax(areas)
-            main_person_box = persons_t[max_idx].cpu().numpy()
-
-        if main_person_box is not None:
-            x1, y1, x2, y2 = map(int, main_person_box)
+            x1, y1, x2, y2 = map(int, persons_t[torch.argmax(areas)].cpu().numpy())
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(width, x2), min(height, y2)
             person_roi = frame[y1:y2, x1:x2]
 
             if person_roi.size > 0:
                 h_roi, w_roi, _ = person_roi.shape
-                roi_rgb = cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB)
-                mp_results = pose_estimator.process(roi_rgb)
+                mp_results = pose_estimator.process(cv2.cvtColor(person_roi, cv2.COLOR_BGR2RGB))
 
                 if mp_results.pose_landmarks:
-                    landmarks = mp_results.pose_landmarks.landmark
-                    skeleton_info = {"bbox": [x1, y1, x2, y2], "keypoints": []}
+                    for j, lm in enumerate(mp_results.pose_landmarks.landmark):
+                        # ROI 正規化座標 → 画像全体の正規化座標
+                        xyz[j] = ((x1 + lm.x * w_roi) / width,
+                                  (y1 + lm.y * h_roi) / height,
+                                  lm.z * w_roi / width)
+                        vis[j] = lm.visibility
+                    found = True
+                    bbox = [x1, y1, x2, y2]
 
-                    # 奥行き(Z)の幾何計算
-                    mid_shoulder_x = (landmarks[11].x + landmarks[12].x) / 2.0 * w_roi
-                    mid_shoulder_y = (landmarks[11].y + landmarks[12].y) / 2.0 * h_roi
-                    mid_hip_x = (landmarks[23].x + landmarks[24].x) / 2.0 * w_roi
-                    mid_hip_y = (landmarks[23].y + landmarks[24].y) / 2.0 * h_roi
-                    
-                    current_torso_length = math.sqrt((mid_shoulder_x - mid_hip_x)**2 + (mid_shoulder_y - mid_hip_y)**2)
-                    if base_torso_length is None: base_torso_length = current_torso_length
-                    if current_torso_length > base_torso_length: base_torso_length = base_torso_length
-
-                    diff_sq = base_torso_length**2 - current_torso_length**2
-                    dz_pixel = math.sqrt(max(0.0, diff_sq))
-
-                    raw_dz = dz_pixel / h_roi
-                    stable_dz = (prev_calculated_dz * (1.0 - SMOOTHING_FACTOR)) + (raw_dz * SMOOTHING_FACTOR)
-                    prev_calculated_dz = stable_dz
-
-                    # 標準関節ノード処理
-                    for jid in REQUIRED_IDS:
-                        if jid in [99, 100]: continue
-                        lm = landmarks[jid]
-                        curr_x, curr_y = lm.x, lm.y
-                        curr_z = stable_dz + (lm.z * 0.1)
-
-                        velocity = 0.0
-                        if jid in prev_landmarks:
-                            p_x, p_y, p_z = prev_landmarks[jid]
-                            dist = math.sqrt((curr_x - p_x)**2 + (curr_y - p_y)**2 + (curr_z - p_z)**2)
-                            velocity = round(dist * fps, 4)
-
-                        kp_data = {
-                            "id": jid,
-                            "rel_coord": {"x": round(curr_x, 4), "y": round(curr_y, 4), "z": round(curr_z, 4)},
-                            "visibility": round(lm.visibility, 4),
-                            "velocity": velocity
-                        }
-                        skeleton_info["keypoints"].append(kp_data)
-                        prev_landmarks[jid] = (curr_x, curr_y, curr_z)
-
-                    # 頭部中心 (ID 100)
-                    head_x = (landmarks[0].x + landmarks[7].x + landmarks[8].x) / 3.0
-                    head_y = (landmarks[0].y + landmarks[7].y + landmarks[8].y) / 3.0
-                    head_z = stable_dz + (((landmarks[0].z + landmarks[7].z + landmarks[8].z) / 3.0) * 0.1)
-                    skeleton_info["keypoints"].append({
-                        "id": 100,
-                        "rel_coord": {"x": round(head_x, 4), "y": round(head_y, 4), "z": round(head_z, 4)},
-                        "visibility": round((landmarks[0].visibility + landmarks[7].visibility + landmarks[8].visibility)/3.0, 4),
-                        "velocity": 0.0
-                    })
-
-                    # ラケット (ID 99)
-                    best_racket = None
-                    min_dist_to_hand = float('inf')
-                    hand_abs_x = x1 + (landmarks[16].x * w_roi)
-                    hand_abs_y = y1 + (landmarks[16].y * h_roi)
-
-                    for r_box in rackets:
-                        rx1, ry1, rx2, ry2 = r_box
-                        r_center_x = (rx1 + rx2) / 2.0
-                        r_center_y = (ry1 + ry2) / 2.0
-                        dist = math.sqrt((hand_abs_x - r_center_x)**2 + (hand_abs_y - r_center_y)**2)
-                        if dist < min_dist_to_hand and dist < 300:
-                            min_dist_to_hand = dist
-                            best_racket = (r_center_x, r_center_y)
-
-                    if best_racket:
-                        racket_rel_x = float(best_racket[0] - x1) / w_roi
-                        racket_rel_y = float(best_racket[1] - y1) / h_roi
-                        racket_rel_z = float(prev_landmarks[16][2])
-                    else:
-                        racket_rel_x, racket_rel_y, racket_rel_z = float(prev_landmarks[16][0]), float(prev_landmarks[16][1]), float(prev_landmarks[16][2])
-
-                    skeleton_info["keypoints"].append({
-                        "id": 99,
-                        "rel_coord": {"x": round(racket_rel_x, 4), "y": round(racket_rel_y, 4), "z": round(racket_rel_z, 4)},
-                        "visibility": 1.0 if best_racket else 0.0,
-                        "velocity": 0.0
-                    })
-
-                    frame_data["skeletons"].append(skeleton_info)
-
-        data_log["frames"].append(frame_data)
-        frame_count += 1
+        xyz_list.append(xyz)
+        vis_list.append(vis)
+        detected.append(found)
+        bboxes.append(bbox)
+        rackets_per_frame.append(rackets)
 
     cap.release()
+    return {
+        "fps": fps, "width": width, "height": height,
+        "xyz": np.array(xyz_list).reshape(-1, NUM_JOINTS, 3),
+        "vis": np.array(vis_list).reshape(-1, NUM_JOINTS),
+        "detected": np.array(detected, dtype=bool),
+        "bboxes": bboxes,
+        "rackets": rackets_per_frame,
+    }
+
+
+# ==============================================================================
+# 🧠 Pipeline ②: best.pt (SkeletonRefiner) による 33 点の補正
+# ==============================================================================
+def refine_landmarks(track: dict) -> np.ndarray:
+    """(T,33,3) の補正済み座標を返す（座標系は Pipeline ① と同じ）。
+    人物が検出された最初〜最後のフレーム区間をひとつの時系列として補正し、
+    区間内の未検出フレーム・低 visibility 点は前処理の PCHIP 補間で埋めてから補正する。
+    モデルが無い場合は生の座標をそのまま返す。"""
+    xyz = track["xyz"].copy()
+    if skeleton_refiner is None:
+        return xyz
+
+    idx = np.flatnonzero(track["detected"])
+    start, end = int(idx[0]), int(idx[-1]) + 1
+    if end - start < 3:
+        return xyz
+
+    meta = {"fps": track["fps"], "resolution": {"width": track["width"], "height": track["height"]}}
+    seq = preprocess_arrays(xyz[start:end], track["vis"][start:end], meta, name="upload")
+
+    coords = torch.from_numpy(seq.coords).to(DEVICE)
+    conf = torch.from_numpy(seq.conf).to(DEVICE)
+    pred = skeleton_refiner.refine_sequence(coords, conf).cpu().numpy()
+    xyz[start:end] = denormalize(seq, pred)
+    return xyz
+
+
+# ==============================================================================
+# 🧠 Pipeline ③: 補正済み 33 点 → 頭部中心 (100)・ラケット (99) を付与
+# ==============================================================================
+def build_keypoint_log(track: dict, xyz: np.ndarray) -> dict:
+    fps, width, height = track["fps"], track["width"], track["height"]
+    vis = track["vis"]
+
+    data_log = {
+        "metadata": {
+            "fps": fps,
+            "resolution": {"width": width, "height": height},
+            "required_ids": REQUIRED_IDS,
+            "coord_frame": "image_normalized",
+            "skeleton_refined": REFINER_INFO,
+        },
+        "frames": []
+    }
+
+    prev = {}
+    for t in range(len(xyz)):
+        frame_data = {"frame_index": t, "timestamp": round(t / fps, 4), "skeletons": []}
+
+        if track["detected"][t]:
+            kps = []
+
+            def add_kp(jid, x, y, z, v):
+                velocity = 0.0
+                if jid in prev:
+                    px, py, pz = prev[jid]
+                    velocity = round(math.sqrt((x - px)**2 + (y - py)**2 + (z - pz)**2) * fps, 4)
+                prev[jid] = (x, y, z)
+                kps.append({
+                    "id": jid,
+                    "rel_coord": {"x": round(float(x), 4), "y": round(float(y), 4), "z": round(float(z), 4)},
+                    "visibility": round(float(v), 4),
+                    "velocity": velocity,
+                })
+
+            # 標準関節 (補正済み MediaPipe 33 点から抽出)
+            for jid in REQUIRED_IDS:
+                if jid in (99, 100): continue
+                add_kp(jid, *xyz[t, jid], vis[t, jid])
+
+            # 頭部中心 (ID 100): 補正後の鼻・両耳の平均
+            hx, hy, hz = xyz[t, HEAD_SRC_IDS].mean(axis=0)
+            add_kp(100, hx, hy, hz, vis[t, HEAD_SRC_IDS].mean())
+
+            # ラケット (ID 99): 補正後の右手首に最も近い YOLO ラケット
+            wx, wy, wz = xyz[t, RACKET_HAND_ID]
+            hand_px = np.array([wx * width, wy * height])
+            best_racket, best_dist = None, RACKET_MAX_DIST_PX
+            for rc in track["rackets"][t]:
+                d = float(np.linalg.norm(hand_px - np.asarray(rc)))
+                if d < best_dist:
+                    best_dist, best_racket = d, rc
+            if best_racket is not None:
+                add_kp(99, best_racket[0] / width, best_racket[1] / height, wz, 1.0)
+            else:
+                add_kp(99, wx, wy, wz, 0.0)  # 未検出時は手首位置で代用
+
+            frame_data["skeletons"].append({"bbox": track["bboxes"][t], "keypoints": kps})
+
+        data_log["frames"].append(frame_data)
+
     return data_log
 
 
 # ==============================================================================
-# 🧠 Pipeline ②: 腰原点アライメント & 接地補正 & 時系列Savgol平滑化
+# 🧠 Pipeline ④: 腰原点アライメント & 接地補正 & 時系列Savgol平滑化
 # ==============================================================================
 def apply_spatial_normalization_and_filter(raw_data: dict, window_length=5, polyorder=2) -> dict:
     fps = raw_data["metadata"]["fps"]
@@ -291,7 +346,7 @@ def apply_spatial_normalization_and_filter(raw_data: dict, window_length=5, poly
         if not frame["skeletons"]: continue
         skeleton = frame["skeletons"][0]
         kp_map = {kp["id"]: kp["rel_coord"] for kp in skeleton["keypoints"]}
-        
+
         if not all(jid in kp_map for jid in [11, 12, 23, 24]): continue
         valid_frame_indices.append(idx)
 
@@ -342,7 +397,7 @@ def apply_spatial_normalization_and_filter(raw_data: dict, window_length=5, poly
     for f_idx in range(len(valid_frame_indices)):
         ly = min(series_data[27]['y'][f_idx], series_data[28]['y'][f_idx])
         if ly < all_frame_lowest_y: all_frame_lowest_y = ly
-    
+
     for jid in REQUIRED_IDS:
         series_data[jid]['y'] = [y - all_frame_lowest_y for y in series_data[jid]['y']]
 
@@ -356,7 +411,7 @@ def apply_spatial_normalization_and_filter(raw_data: dict, window_length=5, poly
     # 4. メモリ内構造の再構築と速度マッピング
     output_frames = []
     prev_norm_coords = {}
-    
+
     for list_idx, idx in enumerate(valid_frame_indices):
         orig_frame = frames[idx]
         skeleton = orig_frame["skeletons"][0]

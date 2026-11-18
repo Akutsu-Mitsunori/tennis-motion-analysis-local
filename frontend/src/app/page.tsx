@@ -16,6 +16,7 @@ import {
   ResponsiveContainer,
   ReferenceLine
 } from 'recharts';
+import Link from 'next/link'
 
 // 骨格結線の定義 (FastAPI側と完全に一貫)
 const POSE_CONNECTIONS = [
@@ -81,13 +82,14 @@ export default function Home() {
     const aSeries: any[] = [];
 
     motionData.frames.forEach((frame: any, idx: number) => {
-      const kpMap: { [key: number]: { x: number; y: number; z: number; velocity?: number } } = {};
-      
+      const kpMap: { [key: number]: { x: number; y: number; z: number; velocity?: number; vis?: number } } = {};
+
       if (frame.skeletons && frame.skeletons[0]) {
         frame.skeletons[0].keypoints.forEach((kp: any) => {
           kpMap[kp.id] = {
             ...kp.rel_coord,
-            velocity: kp.velocity ?? 0
+            velocity: kp.velocity ?? 0,
+            vis: kp.visibility ?? 0
           };
         });
       }
@@ -97,7 +99,8 @@ export default function Home() {
 
       vSeries.push({
         frame: idx + 1,
-        racketHead: roundV(kpMap[100]?.velocity), // ID: 100
+        // ID: 99 (ラケット)。未検出フレーム (visibility=0) は手首位置の代用値なので描画しない
+        racketHead: kpMap[99] && (kpMap[99].vis ?? 0) > 0 ? roundV(kpMap[99].velocity) : null,
         wrist: roundV(kpMap[16]?.velocity),       // ID: 16 (右手首)
         elbow: roundV(kpMap[14]?.velocity),       // ID: 14 (右肘)
         shoulder: roundV(kpMap[12]?.velocity),    // ID: 12 (右肩)
@@ -332,10 +335,18 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-gray-950 text-gray-100 p-6">
       {/* ヘッダー */}
-      <header className="border-b border-gray-800 pb-4 mb-8">
+      <header className="border-b border-gray-800 pb-4 mb-8 flex justify-between items-center">
+      <div>
         <h1 className="text-2xl font-bold tracking-tight text-blue-400">Tennis Motion Analysis MVP</h1>
         <p className="text-sm text-gray-400">AI骨格検出を用いたスイング速度・運動連鎖（Kinematic Chain）解析システム</p>
-      </header>
+      </div>
+      <Link 
+        href="/compare" 
+        className="bg-purple-600 hover:bg-purple-500 text-white font-medium py-2 px-4 rounded-lg text-sm transition-colors flex items-center gap-2"
+      >
+        📊 分析結果比較画面へ
+      </Link>
+    </header>
 
       {/* イントロダクション ＆ 動画アップロード */}
       <section className="mb-8 bg-gray-900 border border-gray-800 rounded-xl p-6">
@@ -460,7 +471,7 @@ export default function Home() {
 
             {/* メタ情報バッジ */}
             {motionData && (
-              <div className="mb-4 grid grid-cols-2 gap-4 bg-gray-950 p-3 rounded-lg border border-gray-800 text-center">
+              <div className="mb-4 grid grid-cols-3 gap-4 bg-gray-950 p-3 rounded-lg border border-gray-800 text-center">
                 <div>
                   <p className="text-[10px] text-gray-400">推測最高ラケット速度</p>
                   <p className="text-sm font-bold text-orange-400">
@@ -472,6 +483,16 @@ export default function Home() {
                   <p className="text-xs font-semibold text-purple-400">
                     {motionData.metadata?.fps || 30} fps / {motionData.frames?.length || 0} frames
                   </p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-gray-400">骨格補正 (best.pt)</p>
+                  {motionData.metadata?.skeleton_refined?.enabled ? (
+                    <p className="text-xs font-semibold text-emerald-400">
+                      有効{motionData.metadata.skeleton_refined.epoch != null && ` (epoch ${motionData.metadata.skeleton_refined.epoch})`}
+                    </p>
+                  ) : (
+                    <p className="text-xs font-semibold text-gray-500">無効</p>
+                  )}
                 </div>
               </div>
             )}
@@ -510,7 +531,7 @@ export default function Home() {
                           />
                         )}
 
-                        <Line type="monotone" dataKey="racketHead" name="ラケットヘッド (ID:100)" stroke="#f97316" strokeWidth={3} dot={false} isAnimationActive={false} />
+                        <Line type="monotone" dataKey="racketHead" name="ラケット (ID:99)" stroke="#f97316" strokeWidth={3} dot={false} isAnimationActive={false} />
                         <Line type="monotone" dataKey="wrist" name="右手首 (ID:16)" stroke="#3b82f6" strokeWidth={2} dot={false} isAnimationActive={false} />
                         <Line type="monotone" dataKey="elbow" name="右肘 (ID:14)" stroke="#10b981" strokeWidth={2} dot={false} isAnimationActive={false} />
                         <Line type="monotone" dataKey="shoulder" name="右肩 (ID:12)" stroke="#eab308" strokeWidth={1.5} strokeDasharray="3 3" dot={false} isAnimationActive={false} />
